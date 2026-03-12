@@ -817,6 +817,7 @@
     <Compile Include="Emulator/Peripherals/Peripherals/Timers/SunxiTimer.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Timers/TexasInstrumentsTimer.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/IRQControllers/AINTC.cs" />
+    <Compile Include="Emulator/Peripherals/Peripherals/Timers/STM32F0_RTC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Timers/STM32F4_RTC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/BitBanding.cs">
       <DependentUpon>BitBanding.tt</DependentUpon>
@@ -995,6 +996,7 @@
     <Compile Include="Emulator/Peripherals/Peripherals/UART/NRF54H20_UARTE.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/ATAPI/ATAPI.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/ATAPI/CDROM.cs" />
+    <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/STM32F0_RCC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/STM32F4_RCC.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/NRF_CLOCK.cs" />
     <Compile Include="Emulator/Peripherals/Peripherals/Miscellaneous/NRF54L_CLOCK.cs" />
