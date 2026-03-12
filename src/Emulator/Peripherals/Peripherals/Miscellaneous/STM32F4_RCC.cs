@@ -34,6 +34,7 @@ namespace Antmicro.Renode.Peripherals.Miscellaneous
             // peripherals or their clocks.
             var registersMap = new Dictionary<long, DoubleWordRegister>
             {
+                // Possible bug? Reset value is 0x0000XX83 for STM32F405/407/415/417/42x/43x and 0x0000XX81 for STM32F401 but is being set to 0x483 here
                 {(long)Registers.ClockControl, new DoubleWordRegister(this, 0x483)
                     .WithFlag(0, out var hsion, name: "HSION")
                     .WithFlag(1, FieldMode.Read, valueProviderCallback: _ => hsion.Value, name: "HSIRDY")
