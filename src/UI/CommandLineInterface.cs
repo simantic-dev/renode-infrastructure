@@ -1,5 +1,5 @@
 //
-// Copyright (c) 2010-2025 Antmicro
+// Copyright (c) 2010-2026 Antmicro
 // Copyright (c) 2011-2015 Realtime Embedded
 //
 // This file is licensed under the MIT License.
@@ -55,26 +55,34 @@ namespace Antmicro.Renode.UI
 #endif
             Logger.AddBackend(new MemoryBackend(), "memory");
             Emulator.ShowAnalyzers = !options.HideAnalyzers;
-            XwtProvider xwt = null;
+            IDisposable ui = null;
             if(options.PidFile != null)
             {
                 var pid = Process.GetCurrentProcess().Id;
                 File.WriteAllText(options.PidFile, pid.ToString());
             }
 
-            if(!options.DisableXwt || options.RobotDebug)
+#if NET
+            if(options.UI)
             {
-                xwt = XwtProvider.Create(new WindowedUserInterfaceProvider());
+                var uiProvider = new UIProvider(WebSockets.WebSocketsManager.Instance.Port);
+                uiProvider.WindowClosed += Emulator.Exit;
+                ui = uiProvider;
+            }
+#endif
+            else if(!options.DisableXwt || options.RobotDebug)
+            {
+                ui = XwtProvider.Create(new WindowedUserInterfaceProvider());
             }
 
-            if(xwt == null && options.RobotFrameworkRemoteServerPort == -1 && !options.Console && !options.ServerMode)
+            if(ui == null && options.RobotFrameworkRemoteServerPort == -1 && !options.Console && !options.ServerMode)
             {
                 if(options.Port == -1)
                 {
                     options.Port = 1234;
                 }
 
-                if(!options.DisableXwt)
+                if(options.UI || !options.DisableXwt)
                 {
                     Logger.Log(LogLevel.Warning, "Couldn't start UI - falling back to console mode");
                     options.Console = true;
@@ -102,7 +110,7 @@ namespace Antmicro.Renode.UI
                     videoAnalyzerType = typeof(DummyVideoAnalyzer);
 #endif
                 }
-                else if(xwt == null || options.RobotDebug)
+                else if(ui == null || options.RobotDebug)
                 {
                     uartAnalyzerType = typeof(LoggingUartAnalyzer);
                     videoAnalyzerType = typeof(DummyVideoAnalyzer);
@@ -126,8 +134,8 @@ namespace Antmicro.Renode.UI
                 Emulator.BeforeExit += () =>
                 {
                     Emulator.DisposeAll();
-                    xwt?.Dispose();
-                    xwt = null;
+                    ui?.Dispose();
+                    ui = null;
                 };
 
                 if(beforeRun != null)
@@ -144,7 +152,7 @@ namespace Antmicro.Renode.UI
                         Logger.AddBackend(ConsoleBackend.Instance, "console", true);
                         terminal = new ConsoleWindowBackendAnalyzer(true);
                         terminal.Show();
-                        shell.Terminal = new NavigableTerminalEmulator(terminal.IO);
+                        shell.Terminal = new NavigableTerminalEmulator(terminal.IO, terminal.SizeSource);
                         shell.Terminal.PlainMode = options.Plain;
 
                         new System.Threading.Thread(x => shell.Start(true))
@@ -169,75 +177,55 @@ namespace Antmicro.Renode.UI
             }
         }
 
-        private static Shell PrepareShell(Options options, Monitor monitor)
+        private static void PrepareIOProvider(Options options, out IOProvider io, out ISizeSource size)
         {
-            Shell shell = null;
+            IIOSource ioSource;
+
             if(options.Console)
             {
-                var io = new IOProvider()
-                {
-                    Backend = new ConsoleIOSource()
-                };
-                shell = ShellProvider.GenerateShell(monitor, true);
-                shell.Terminal = new NavigableTerminalEmulator(io, true);
+                var console = new ConsoleIOSource();
+                ioSource = console;
+                size = console;
             }
             else if(options.Port >= 0)
             {
-                var io = new IOProvider()
-                {
-                    Backend = new SocketIOSource(options.Port)
-                };
-                shell = ShellProvider.GenerateShell(monitor, true);
-                shell.Terminal = new NavigableTerminalEmulator(io, true);
+                var socket = new SocketIOSource(options.Port);
+                ioSource = socket;
+                size = socket;
 
                 Logger.Log(LogLevel.Info, "Monitor available in telnet mode on port {0}", options.Port);
             }
 #if NET
             else if(options.ServerMode)
             {
-                var io = new IOProvider()
-                {
-                    // Same as in logger - 29169 is only text in http request
-                    Backend = new WebSocketIOSource("/telnet/29169")
-                };
-                shell = ShellProvider.GenerateShell(monitor, true);
-                shell.Terminal = new NavigableTerminalEmulator(io, true);
+                ioSource = new WebSocketIOSource("/telnet/29169");
+                // TODO: Report terminal size via main WS connection?
+                size = null;
             }
 #endif
+            else if(options.HideMonitor)
+            {
+                ioSource = new DummyIOSource();
+                size = null;
+            }
             else
             {
-                ConsoleWindowBackendAnalyzer terminal = null;
-                IOProvider io;
-                if(options.HideMonitor)
-                {
-                    io = new IOProvider { Backend = new DummyIOSource() };
-                }
-                else
-                {
-                    terminal = new ConsoleWindowBackendAnalyzer(true);
-                    io = terminal.IO;
-                }
-
-                // forcing vcursor is necessary, because calibrating will never end if the window is not shown
-                shell = ShellProvider.GenerateShell(monitor, forceVCursor: options.HideMonitor);
-                shell.Terminal = new NavigableTerminalEmulator(io, options.HideMonitor);
-
-                if(terminal != null)
-                {
-                    try
-                    {
-                        Emulator.BeforeExit += shell.Stop;
-                        terminal.Quitted += Emulator.Exit;
-                        terminal.Show();
-                    }
-                    catch(InvalidOperationException ex)
-                    {
-                        Console.ForegroundColor = ConsoleColor.Red;
-                        Console.Error.WriteLine(ex.Message);
-                        Emulator.Exit();
-                    }
-                }
+                var terminal = new ConsoleWindowBackendAnalyzer(true);
+                terminal.Show();
+                io = terminal.IO;
+                size = terminal.SizeSource;
+                return;
             }
+            io = new IOProvider { Backend = ioSource };
+        }
+
+        private static Shell PrepareShell(Options options, Monitor monitor)
+        {
+            PrepareIOProvider(options, out var io, out var size);
+
+            var shell = ShellProvider.GenerateShell(monitor);
+            shell.Terminal = new NavigableTerminalEmulator(io, size);
+
             monitor.Quitted += shell.Stop;
             shell.Quitted += Emulator.Exit;
 

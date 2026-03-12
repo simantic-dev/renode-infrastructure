@@ -6,6 +6,7 @@
 //
 using System;
 using System.Collections.Generic;
+using System.Linq;
 
 using Antmicro.Renode.Core;
 using Antmicro.Renode.Core.Structure.Registers;
@@ -16,7 +17,7 @@ using Antmicro.Renode.Utilities;
 
 namespace Antmicro.Renode.Peripherals.UART
 {
-    public class NXP_LPUART : UARTBase, IUARTWithBufferState, ILINController, IBytePeripheral, IDoubleWordPeripheral, IKnownSize
+    public class NXP_LPUART : UARTBaseWithFrameInfo, IUARTWithBufferState, ILINController, IBytePeripheral, IDoubleWordPeripheral, IKnownSize
     {
         public NXP_LPUART(IMachine machine, long frequency = 8000000, bool hasGlobalRegisters = true, bool hasFifoRegisters = true, uint fifoSize = DefaultFIFOSize, bool separateIRQs = false) : base(machine)
         {
@@ -91,9 +92,9 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithReservedBits(0, 14)
                 .WithTaggedFlag("MA2F / Match 2 Flag", 14)
                 .WithTaggedFlag("MA1F / Match 1 Flag", 15)
-                .WithTaggedFlag("PF / Parity Error Flag", 16)
-                .WithTaggedFlag("FE / Framing Error Flag", 17)
-                .WithTaggedFlag("NF / Noise Flag", 18)
+                .WithFlag(16, out parityErrorFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "PF / Parity Error Flag")
+                .WithFlag(17, out framingErrorFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "FE / Framing Error Flag")
+                .WithFlag(18, out noiseFlag, FieldMode.Read | FieldMode.WriteOneToClear, name: "NF / Noise Flag")
                 .WithFlag(19, out receiverOverrun, FieldMode.Read | FieldMode.WriteOneToClear, name: "OR / Receiver Overrun Flag")
                 .WithTaggedFlag("IDLE / Idle Line Flag", 20)
                 // Despite the name below flag should be set when Watermark level is exceeded
@@ -144,9 +145,9 @@ namespace Antmicro.Renode.Peripherals.UART
                 .WithFlag(21, out receiverInterruptEnabled, name: "RIE / Receiver Interrupt Enable")
                 .WithFlag(22, out transmissionCompleteInterruptEnabled, name: "TCIE / Transmission Complete Interrupt Enable")
                 .WithFlag(23, out transmitterInterruptEnabled, name: "TIE / Transmission Interrupt Enable")
-                .WithTaggedFlag("PEIE / Parity Error Interrupt Enable", 24)
-                .WithTaggedFlag("FEIE / Framing Error Interrupt Enable", 25)
-                .WithTaggedFlag("NEIE / Noise Error Interrupt Enable", 26)
+                .WithFlag(24, out parityErrorInterruptEnable, name: "PEIE / Parity Error Interrupt Enable")
+                .WithFlag(25, out framingErrorInterruptEnable, name: "FEIE / Framing Error Interrupt Enable")
+                .WithFlag(26, out noiseErrorInterruptEnable, name: "NEIE / Noise Error Interrupt Enable")
                 .WithFlag(27, out overrunInterruptEnable, name: "ORIE / Overrun Interrupt Enable")
                 .WithTaggedFlag("TXINV / Transmit Data Inversion", 28)
                 .WithFlag(29, out transmissionPinDirectionOutNotIn, name: "TXDIR / TXD Pin Direction in Single-Wire Mode")
@@ -167,6 +168,7 @@ namespace Antmicro.Renode.Peripherals.UART
                         }
                         else
                         {
+                            UpdateErrorFlags();
                             UpdateBufferState();
                             OnBufferStateChanged();
                         }
@@ -332,6 +334,9 @@ namespace Antmicro.Renode.Peripherals.UART
                 UpdateBufferState();
                 UpdateGPIOOutputs();
                 reset.Value = true;
+                InjectFramingError = false;
+                InjectNoiseError = false;
+                InjectParityError = false;
             }
         }
 
@@ -381,8 +386,22 @@ namespace Antmicro.Renode.Peripherals.UART
 
         public override void WriteChar(byte data)
         {
+            WriteChar(data, null);
+        }
+
+        /// <remark>
+        /// `frame` is null when the standard UART api is in use, so care has to be taken to do null checks before using it
+        /// </remark>
+        public override void WriteChar(byte data, UARTFrame frame)
+        {
             lock(locker)
             {
+                if(frame != null && frame.BaudRate != this.BaudRate)
+                {
+                    this.Log(LogLevel.Warning, "Missmatched baud rate, dropping character (transmitter {0}, reciver {1})", frame?.BaudRate, this.BaudRate);
+                    return;
+                }
+
                 if(loopMode.Value)
                 {
                     if(receiverSource.Value && transmissionPinDirectionOutNotIn.Value)
@@ -409,8 +428,50 @@ namespace Antmicro.Renode.Peripherals.UART
                     this.Log(LogLevel.Debug, "RX FIFO is overflowing, but we are buffering characters, reached {0} bytes", Count + 1);
                 }
 
-                base.WriteChar(data);
+                // If this method is called without a UARTFrame, but we still have an error to inject we need to create a dummy frame
+                if(frame == null && (InjectFramingError || InjectNoiseError || InjectParityError))
+                {
+                    frame = UARTFrame.CreateFromSenderAndMessage(this, data);
+                }
+
+                if(InjectNoiseError)
+                {
+                    frame.Noise = true;
+                }
+                if(InjectParityError)
+                {
+                    if(frame.ParityBit == UARTFrame.ParityBitValue.None)
+                    {
+                        this.Log(LogLevel.Warning, "Attempted to inject parity error with LPUART configured to not use parity bit. Ignoring");
+                    }
+                    else
+                    {
+                        if(frame.ParityBit == UARTFrame.ParityBitValue.Unsupported)
+                        {
+                            // Transmitter model does not model parity bits, so calculate the correct value first
+                            frame.ParityBit = UARTFrame.CalculateParityBit(data, this.ParityBit);
+                        }
+                        frame.ParityBit = frame.ParityBit == UARTFrame.ParityBitValue.Zero ? UARTFrame.ParityBitValue.One : UARTFrame.ParityBitValue.Zero;
+                    }
+                }
+                if(InjectFramingError)
+                {
+                    // For the error injection it does not matter which setting we end up with, as long as it is not the original one.
+                    // Since there are many possible settings for the stop bits, here we use a LINQ statement to get the next value numerically in the enum.
+                    frame.StopBits = (from Bits val in Enum.GetValues(typeof(Bits))
+                                      where val > frame.StopBits
+                                      orderby val
+                                      select val).DefaultIfEmpty().First();
+                }
+
+                // Clear all error injection flags after using them
+                InjectFramingError = false;
+                InjectNoiseError = false;
+                InjectParityError = false;
+
+                base.WriteChar(data, frame);
                 UpdateBufferState();
+                UpdateErrorFlags();
                 UpdateGPIOOutputs();
             }
         }
@@ -440,6 +501,12 @@ namespace Antmicro.Renode.Peripherals.UART
         public GPIO ReceiveDMA { get; }
 
         public GPIO TransmitDMA { get; }
+
+        public bool InjectFramingError { get; set; }
+
+        public bool InjectNoiseError { get; set; }
+
+        public bool InjectParityError { get; set; }
 
         public event Action BroadcastLINBreak;
 
@@ -490,7 +557,10 @@ namespace Antmicro.Renode.Peripherals.UART
             var rx = receiverInterruptEnabled.Value && (BufferState == BufferState.Ready || BufferState == BufferState.Full); // Watermark level exceeded
             var linBreak = linBreakDetect.Value && linBreakDetectInterruptEnable.Value;
             var rxOverrun = overrunInterruptEnable.Value && receiverOverrun.Value;
-            var rxRequest = rxUnderflow || rx || linBreak || rxOverrun;
+            var noiseError = noiseFlag.Value && noiseErrorInterruptEnable.Value;
+            var framingError = framingErrorFlag.Value && framingErrorInterruptEnable.Value;
+            var parityError = parityErrorFlag.Value && parityErrorInterruptEnable.Value;
+            var rxRequest = rxUnderflow || rx || linBreak || rxOverrun || noiseError || framingError || parityError;
 
             var txOverflow = transmitFifoOverflowEnabled.Value && transmitFifoOverflowInterrupt.Value;
             var tx = transmitterInterruptEnabled.Value && transmitDataRegisterEmpty.Value;
@@ -500,7 +570,7 @@ namespace Antmicro.Renode.Peripherals.UART
             if(separateIRQs)
             {
                 SeparateRxIRQ.Set(rxRequest);
-                this.Log(LogLevel.Debug, "Setting SeparateRxIRQ to {0}; rxUnderflow {1}, rx {2}, linBreak {3}", rxRequest, rxUnderflow, rx, linBreak);
+                this.Log(LogLevel.Debug, "Setting SeparateRxIRQ to {0}; rxUnderflow {1}, rx {2}, linBreak {3}, noiseError {4}, framingError {5}, parityError {6}", rxRequest, rxUnderflow, rx, linBreak, noiseError, framingError, parityError);
 
                 IRQ.Set(txRequest);
                 this.Log(LogLevel.Debug, "Setting IRQ to {0}; txOverflow {1}, tx {2}, txComplete {3}", txRequest, txOverflow, tx, txComplete);
@@ -508,8 +578,31 @@ namespace Antmicro.Renode.Peripherals.UART
             else
             {
                 var irqState = txRequest || rxRequest;
-                this.Log(LogLevel.Noisy, "Setting IRQ to {0}, rxUnderflow {1}, txOverflow {2}, tx {3}, rx {4}, txComplete {5}, linBreak {6}", irqState, rxUnderflow, txOverflow, tx, rx, txComplete, linBreak);
+                this.Log(LogLevel.Noisy, "Setting IRQ to {0}, rxUnderflow {1}, txOverflow {2}, tx {3}, rx {4}, txComplete {5}, linBreak {6}, noiseError {7}, framingError {8}, parityError {9}", irqState, rxUnderflow, txOverflow, tx, rx, txComplete, linBreak, noiseError, framingError, parityError);
                 IRQ.Set(irqState);
+            }
+        }
+
+        private void UpdateErrorFlags()
+        {
+            // Error flags are based on the next character in the RX FIFO, start with them cleared
+            noiseFlag.Value = false;
+            framingErrorFlag.Value = false;
+            parityErrorFlag.Value = false;
+            if(TryGetCharacterWithFrame(out var data, out var frame, peek: true) && frame != null)
+            {
+                if(frame.StopBits != this.StopBits)
+                {
+                    framingErrorFlag.Value = true;
+                }
+                if(frame.ParityBit != UARTFrame.ParityBitValue.Unsupported && frame.ParityBit != UARTFrame.CalculateParityBit(data, this.ParityBit))
+                {
+                    parityErrorFlag.Value = true;
+                }
+                if(frame.Noise)
+                {
+                    noiseFlag.Value = true;
+                }
             }
         }
 
@@ -525,6 +618,10 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 this.DebugLog("Setting TransmitDMA to true");
                 dmaTransmittedData = false;
+                if(TransmitDMA.IsSet)
+                {
+                    TransmitDMA.Unset();
+                }
                 TransmitDMA.Set();
                 // Transmission is instantaneous, so we either deassert signal immediately if we received data,
                 // or we keep the signal in high state and break the loop waiting on the next transfer
@@ -554,6 +651,10 @@ namespace Antmicro.Renode.Peripherals.UART
             {
                 this.DebugLog("Setting ReceiveDMA request to true");
                 dmaReceivedData = false;
+                if(ReceiveDMA.IsSet)
+                {
+                    ReceiveDMA.Unset();
+                }
                 ReceiveDMA.Set();
                 if(!dmaReceivedData)
                 {
@@ -660,6 +761,7 @@ namespace Antmicro.Renode.Peripherals.UART
         private BufferState latestBufferState = BufferState.Empty;
         private int rxMaxBytes = 1;
         private int txMaxBytes = 1;
+
         private readonly object locker;
         private readonly Queue<byte> txQueue;
         private readonly DoubleWordRegisterCollection registers;
@@ -680,6 +782,9 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly IFlagRegisterField transmissionCompleteInterruptEnabled;
         private readonly IFlagRegisterField transmitterInterruptEnabled;
         private readonly IFlagRegisterField overrunInterruptEnable;
+        private readonly IFlagRegisterField noiseErrorInterruptEnable;
+        private readonly IFlagRegisterField framingErrorInterruptEnable;
+        private readonly IFlagRegisterField parityErrorInterruptEnable;
         private readonly IFlagRegisterField transmissionPinDirectionOutNotIn;
         private readonly IFlagRegisterField receiveFifoEnabled;
         private readonly IFlagRegisterField transmitFifoEnabled;
@@ -693,6 +798,9 @@ namespace Antmicro.Renode.Peripherals.UART
         private readonly IFlagRegisterField linBreakDetection;
         private readonly IValueRegisterField baudRateModuloDivisor;
         private readonly IValueRegisterField oversamplingRatio;
+        private readonly IFlagRegisterField noiseFlag;
+        private readonly IFlagRegisterField framingErrorFlag;
+        private readonly IFlagRegisterField parityErrorFlag;
         private readonly long frequency;
         private readonly bool hasGlobalRegisters;
         private readonly bool separateIRQs;
